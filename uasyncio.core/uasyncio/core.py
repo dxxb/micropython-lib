@@ -5,6 +5,8 @@ except ImportError:
 import uheapq as heapq
 import logging
 
+class CancelledError(Exception):
+    pass
 
 log = logging.getLogger("asyncio")
 
@@ -30,11 +32,11 @@ class EventLoop:
     def call_later(self, delay, callback, *args):
         self.call_at(self.time() + delay, callback, *args)
 
-    def call_at(self, time, callback, *args):
+    def call_at(self, time, callback, *args, exc=None):
         # Including self.cnt is a workaround per heapq docs
         if __debug__:
-            log.debug("Scheduling %s", (time, self.cnt, callback, args))
-        heapq.heappush(self.q, (time, self.cnt, callback, args))
+            log.debug("Scheduling %s", (time, self.cnt, callback, args, exc))
+        heapq.heappush(self.q, (time, self.cnt, callback, args, exc))
 #        print(self.q)
         self.cnt += 1
 
@@ -45,16 +47,28 @@ class EventLoop:
             log.debug("Sleeping for: %s", delay)
         time.sleep(delay)
 
+    def cancel(self, callback, exc = CancelledError):
+        _id = id(callback)
+        for idx, item in enumerate(self.q):
+            t, cnt, cb, args, exc = item
+            if id(cb) != _id:
+                continue
+            del self.q[idx]
+            heapq.heapify(self.q)
+            self.call_at(0, cb, *args, exc=exc)
+            return
+        self.remove_polled_cb(callback)
+
     def run_forever(self):
         while True:
             if self.q:
-                t, cnt, cb, args = heapq.heappop(self.q)
+                t, cnt, cb, args, exc = heapq.heappop(self.q)
                 if __debug__:
-                    log.debug("Next coroutine to run: %s", (t, cnt, cb, args))
+                    log.debug("Next coroutine to run: %s", (t, cnt, cb, args, exc))
 #                __main__.mem_info()
                 tnow = self.time()
                 delay = t - tnow
-                if delay > 0:
+                if delay > 0 and not exc:
                     self.call_at(t, cb, *args)
                     self.wait(delay)
                     continue
@@ -62,14 +76,21 @@ class EventLoop:
                 self.wait(-1)
                 # Assuming IO completion scheduled some tasks
                 continue
-            if callable(cb):
+            # cancelled callbacks aren't called and nor rescheduled
+            if callable(cb) and not exc:
                 cb(*args)
             else:
                 delay = 0
                 try:
                     if __debug__:
-                        log.debug("Coroutine %s send args: %s", cb, args)
-                    if args == ():
+                        log.debug("Coroutine %s send args: %s, %s", cb, args, exc)
+                    if exc:
+                        try:
+                            ret = cb.throw(exc)
+                        except exc:
+                            # ret == None reschedules a canceled task, next round it should raise StopIteration
+                            ret = None
+                    elif args == ():
                         ret = next(cb)
                     else:
                         ret = cb.send(*args)
